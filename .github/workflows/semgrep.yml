@@ -23,4 +23,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          semgrep scan --config p/default --baseline-commit "$BASE_SHA" --error --metrics=off --disable-version-check
+          # Fuera la regla que pide 7 días de cuarentena en pnpm: la política de la casa
+          # es 1 día (doc 78, JC 22-oct) y la mide el semáforo; se revisa el 23-oct.
+          semgrep scan --config p/default --baseline-commit "$BASE_SHA" --error --metrics=off --disable-version-check \
+            --exclude-rule package_managers.pnpm.pnpm-missing-minimum-release-age.pnpm-minimum-release-age
