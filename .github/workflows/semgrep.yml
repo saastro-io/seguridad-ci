@@ -1,0 +1,26 @@
+name: semgrep
+# Exigido por la regla de la org saastro-io (decisión 01M5JAWH88, 22-oct):
+# análisis estático de lo que el PR añade frente a su base. Imagen fijada por
+# digest (1.182.0, publicada el 20-oct: más vieja que la cuarentena de un día).
+on:
+  pull_request:
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: semgrep (solo lo nuevo del PR)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          semgrep scan --config p/default --baseline-commit "$BASE_SHA" --error --metrics=off --disable-version-check
