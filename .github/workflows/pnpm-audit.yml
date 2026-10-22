@@ -1,0 +1,22 @@
+name: pnpm-audit
+# Exigido por la regla de la org saastro-io (decisión 01M5JAWH88, 22-oct):
+# dependencias de producción con vulnerabilidades altas o críticas.
+on:
+  pull_request:
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  pnpm-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: pnpm audit (producción, altas y críticas)
+        run: |
+          set -euo pipefail
+          if [ ! -f pnpm-lock.yaml ]; then echo "sin pnpm-lock.yaml: nada que auditar"; exit 0; fi
+          corepack enable
+          pnpm audit --prod --audit-level high
