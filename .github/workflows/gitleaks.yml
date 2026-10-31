@@ -5,7 +5,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  # Prefijo propio: el repo consumidor puede tener un workflow con el mismo nombre
+  # (saastro-office tiene su `gitleaks`) y compartir grupo cancelaba su job.
+  group: seguridad-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   gitleaks:
