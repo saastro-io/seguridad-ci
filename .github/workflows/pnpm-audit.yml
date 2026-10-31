@@ -6,17 +6,26 @@ on:
   merge_group:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   pnpm-audit:
-    runs-on: ubuntu-latest
+    # Repos privados: el Mac de JC (runners de org mac-jc-1..4, sin minutos). Públicos: ubuntu,
+    # porque un PR de fork no debe ejecutar código en el Mac (revisión de seguridad, P2).
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","mac-jc"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
       - name: pnpm audit (producción, altas y críticas)
         run: |
           set -euo pipefail
           if [ ! -f pnpm-lock.yaml ]; then echo "sin pnpm-lock.yaml: nada que auditar"; exit 0; fi
-          corepack enable
-          pnpm audit --prod --audit-level high
+          # Sin `corepack enable` (escribe symlinks globales que los 4 runners
+          # del Mac comparten): pnpm fijado por npx.
+          npx --yes pnpm@10.33.2 audit --prod --audit-level high

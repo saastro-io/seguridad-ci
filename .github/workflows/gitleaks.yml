@@ -4,9 +4,14 @@ on:
   merge_group:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   gitleaks:
-    runs-on: ubuntu-latest
+    # Repos privados: el Mac de JC (runners de org mac-jc-1..4, sin minutos). Públicos: ubuntu,
+    # porque un PR de fork no debe ejecutar código en el Mac (revisión de seguridad, P2).
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","mac-jc"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -14,13 +19,20 @@ jobs:
           persist-credentials: false
       - name: gitleaks (solo los commits del PR)
         env:
-          GITLEAKS_VERSION: 8.30.1
-          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
-          curl -sSfL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  gl.tgz" | sha256sum -c -
-          tar -xzf gl.tgz gitleaks
-          ./gitleaks git --redact --no-banner --exit-code 1 --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+          GITLEAKS_VERSION=8.30.1
+          if [ "$RUNNER_OS" = Linux ]; then
+            curl -sSfL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gl.tgz" | sha256sum -c -
+            tar -xzf gl.tgz gitleaks
+            export PATH="$PWD:$PATH"
+          else
+            export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+            command -v gitleaks >/dev/null || brew install gitleaks
+          fi
+          # La versión es la que midió la casa: si el Mac trae otra, falla en vez de escanear distinto.
+          [ "$(gitleaks version)" = "$GITLEAKS_VERSION" ] || { echo "gitleaks $(gitleaks version) != $GITLEAKS_VERSION"; exit 1; }
+          gitleaks git --redact --no-banner --exit-code 1 --log-opts="${BASE_SHA}..${HEAD_SHA}" .
