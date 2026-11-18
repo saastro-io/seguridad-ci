@@ -1,0 +1,29 @@
+name: probar-audit
+# Prueba el script embebido de pnpm-audit.yml (códigos de salida 0/1/2) con un pnpm falso.
+# Corre en ESTE repo; no es un workflow requerido de la org.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/pnpm-audit.yml"
+      - ".github/workflows/probar-audit.yml"
+      - "tests/**"
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: seguridad-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  probar-audit:
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","mac-jc"]') || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Pruebas del script por diferencia
+        run: node --test tests/
