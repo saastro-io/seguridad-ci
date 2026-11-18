@@ -1,6 +1,10 @@
 name: pnpm-audit
 # Exigido por la regla de la org saastro-io (decisión 01M5JAWH88, 22-oct):
-# dependencias de producción con vulnerabilidades altas o críticas.
+# dependencias de producción con vulnerabilidades altas o críticas, POR DIFERENCIA:
+# solo falla lo que el PR introduce respecto a su base (la deuda heredada se imprime y no
+# bloquea; un aviso sin parche publicado ya no pone en rojo a todo repo, 18-nov).
+# El script va inline porque un workflow requerido por la org corre en el repo consumidor,
+# que no trae este checkout (y seguridad-ci es privado).
 on:
   pull_request:
   merge_group:
@@ -24,10 +28,135 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
-      - name: pnpm audit (producción, altas y críticas)
+      - name: Traer la base del PR (el token solo vive en el entorno de este paso)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          if [ ! -f pnpm-lock.yaml ]; then echo "sin pnpm-lock.yaml: nada que auditar"; exit 0; fi
-          # Sin `corepack enable` (escribe symlinks globales que los 4 runners
-          # del Mac comparten): pnpm fijado por npx.
-          npx --yes pnpm@10.33.2 audit --prod --audit-level high
+          # persist-credentials: false quita el token del git config y en repos privados la
+          # base no se puede traer sin él. Va por entorno (GIT_CONFIG_*), nunca por argv.
+          AUTH="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH" \
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+      - name: pnpm audit por diferencia (producción, altas y críticas)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/audit-por-diferencia.mjs" <<'AUDIT_EOF'
+          #!/usr/bin/env node
+          /**
+           * `pnpm audit --prod` POR DIFERENCIA: falla solo con avisos high/critical que el
+           * PR introduce, no con la deuda que la base ya tenía.
+           *
+           * Por qué: un aviso sin parche publicado (p. ej. GHSA-fc5q-39xc-vjpf, picomatch)
+           * ponía en rojo a TODO repo que lo arrastrara y bloqueaba cualquier merge sin que
+           * el PR tuviera culpa (18-nov). Un check que nace rojo se ignora; este nace verde
+           * y sigue cazando lo nuevo.
+           *
+           * Uso: BASE_SHA=<sha> node audit-por-diferencia.mjs   (cwd = checkout del head)
+           * Mide el head y el BASE_SHA con el mismo comando y compara por clave
+           * `ghsa::paquete::versionesAfectadas` (el GHSA a secas se repite entre majors).
+           * La deuda de la base se imprime siempre, no se esconde.
+           *
+           * Salida: 0 sin avisos nuevos · 1 hay avisos nuevos · 2 no se pudo medir
+           * (un JSON ilegible NUNCA cuenta como «cero avisos»).
+           */
+          import { execFileSync } from 'node:child_process'
+          import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+          import { tmpdir } from 'node:os'
+          import { join } from 'node:path'
+
+          const GRAVES = new Set(['high', 'critical'])
+          const PNPM = process.env.PNPM_CMD ? process.env.PNPM_CMD.split(' ') : ['npx', '--yes', 'pnpm@10.33.2']
+          const clave = (a) => `${a.ghsa}::${a.paquete}::${a.versionesAfectadas}`
+
+          class Falla extends Error {}
+
+          function git(args, cwd) {
+            return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })
+          }
+
+          function avisos(cwd, etiqueta) {
+            if (!existsSync(join(cwd, 'pnpm-lock.yaml'))) return new Map() // sin lockfile no hay nada que auditar
+            let salida = ''
+            try {
+              salida = execFileSync(PNPM[0], [...PNPM.slice(1), 'audit', '--prod', '--json'], {
+                cwd,
+                encoding: 'utf8',
+                maxBuffer: 64 * 1024 * 1024,
+                stdio: ['ignore', 'pipe', 'ignore'],
+              })
+            } catch (e) {
+              salida = e.stdout ?? '' // pnpm audit sale != 0 cuando encuentra algo: lo que vale es el JSON
+            }
+            let datos
+            try {
+              datos = JSON.parse(salida)
+            } catch {
+              throw new Falla(`\`pnpm audit --prod --json\` (${etiqueta}) no devolvió JSON legible. No se interpreta como «sin avisos»: el control falla a propósito.`)
+            }
+            if (!datos || typeof datos.advisories !== 'object' || datos.advisories === null) {
+              throw new Falla(`el JSON de pnpm audit (${etiqueta}) no trae \`advisories\` (¿error del registro o formato nuevo?). Falla en vez de dar por bueno un cero.`)
+            }
+            const m = new Map()
+            for (const a of Object.values(datos.advisories)) {
+              if (!GRAVES.has(a.severity)) continue
+              const x = { ghsa: a.github_advisory_id, paquete: a.module_name, gravedad: a.severity, versionesAfectadas: a.vulnerable_versions, titulo: a.title }
+              m.set(clave(x), x)
+            }
+            return m
+          }
+
+          /** 0 sin avisos nuevos · 1 avisos nuevos · 2 no se pudo medir (cualquier fallo, incluido el de git). */
+          function main() {
+            const baseSha = process.env.BASE_SHA
+            if (!baseSha) throw new Falla('falta BASE_SHA: sin base no hay diferencia que medir.')
+
+            const raiz = git(['rev-parse', '--show-toplevel']).trim()
+            const tmp = mkdtempSync(join(tmpdir(), 'audit-base-'))
+            const wt = join(tmp, 'base')
+            let base
+            try {
+              try {
+                git(['cat-file', '-e', `${baseSha}^{commit}`], raiz)
+              } catch {
+                git(['fetch', '--no-tags', '--depth=1', 'origin', baseSha], raiz)
+              }
+              git(['worktree', 'add', '--detach', wt, baseSha], raiz)
+              base = avisos(wt, `base ${baseSha.slice(0, 8)}`)
+            } finally {
+              try { git(['worktree', 'remove', '--force', wt], raiz) } catch {}
+              rmSync(tmp, { recursive: true, force: true })
+            }
+            const hoy = avisos(raiz, 'head')
+
+            const nuevos = [...hoy.values()].filter((a) => !base.has(clave(a)))
+            const heredados = [...hoy.values()].filter((a) => base.has(clave(a)))
+
+            console.log(`Base ${baseSha.slice(0, 8)}: ${base.size} avisos high/critical. Head: ${hoy.size}.`)
+            if (heredados.length) {
+              console.log(`Deuda heredada de la base (no bloquea): ${heredados.length}`)
+              for (const a of heredados) console.log(`  ${a.gravedad}  ${a.ghsa}  ${a.paquete} ${a.versionesAfectadas}`)
+            }
+            if (nuevos.length) {
+              console.error(`::error::${nuevos.length} aviso(s) NUEVO(s) high/critical introducidos por este PR:`)
+              for (const a of nuevos) console.error(`  ${a.gravedad}  ${a.ghsa}  ${a.paquete} ${a.versionesAfectadas} — ${a.titulo}`)
+              return 1
+            }
+            console.log('✓ ningún aviso nuevo respecto a la base')
+            return 0
+          }
+
+          try {
+            process.exitCode = main()
+          } catch (e) {
+            console.error(`::error::${e instanceof Falla ? e.message : `no se pudo medir: ${e?.message ?? e}`}. Sale con 2, no con 1: no es «hay avisos nuevos».`)
+            process.exitCode = 2
+          }
+          AUDIT_EOF
+          # Sin `corepack enable` (escribe symlinks globales que los 4 runners del Mac
+          # comparten): pnpm fijado por npx dentro del script.
+          node "$RUNNER_TEMP/audit-por-diferencia.mjs"
