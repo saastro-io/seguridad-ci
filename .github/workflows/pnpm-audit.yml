@@ -28,6 +28,18 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
+      - name: Traer la base del PR (el token solo vive en el entorno de este paso)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          # persist-credentials: false quita el token del git config y en repos privados la
+          # base no se puede traer sin él. Va por entorno (GIT_CONFIG_*), nunca por argv.
+          AUTH="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH" \
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
       - name: pnpm audit por diferencia (producción, altas y críticas)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
@@ -61,6 +73,8 @@ jobs:
           const PNPM = process.env.PNPM_CMD ? process.env.PNPM_CMD.split(' ') : ['npx', '--yes', 'pnpm@10.33.2']
           const clave = (a) => `${a.ghsa}::${a.paquete}::${a.versionesAfectadas}`
 
+          class Falla extends Error {}
+
           function git(args, cwd) {
             return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })
           }
@@ -82,12 +96,10 @@ jobs:
             try {
               datos = JSON.parse(salida)
             } catch {
-              console.error(`::error::\`pnpm audit --prod --json\` (${etiqueta}) no devolvió JSON legible. No se interpreta como «sin avisos»: el control falla a propósito.`)
-              process.exit(2)
+              throw new Falla(`\`pnpm audit --prod --json\` (${etiqueta}) no devolvió JSON legible. No se interpreta como «sin avisos»: el control falla a propósito.`)
             }
             if (!datos || typeof datos.advisories !== 'object' || datos.advisories === null) {
-              console.error(`::error::el JSON de pnpm audit (${etiqueta}) no trae \`advisories\` (¿error del registro o formato nuevo?). Falla en vez de dar por bueno un cero.`)
-              process.exit(2)
+              throw new Falla(`el JSON de pnpm audit (${etiqueta}) no trae \`advisories\` (¿error del registro o formato nuevo?). Falla en vez de dar por bueno un cero.`)
             }
             const m = new Map()
             for (const a of Object.values(datos.advisories)) {
@@ -98,44 +110,52 @@ jobs:
             return m
           }
 
-          const baseSha = process.env.BASE_SHA
-          if (!baseSha) {
-            console.error('::error::falta BASE_SHA: sin base no hay diferencia que medir.')
-            process.exit(2)
-          }
+          /** 0 sin avisos nuevos · 1 avisos nuevos · 2 no se pudo medir (cualquier fallo, incluido el de git). */
+          function main() {
+            const baseSha = process.env.BASE_SHA
+            if (!baseSha) throw new Falla('falta BASE_SHA: sin base no hay diferencia que medir.')
 
-          const raiz = git(['rev-parse', '--show-toplevel']).trim()
-          const tmp = mkdtempSync(join(tmpdir(), 'audit-base-'))
-          const wt = join(tmp, 'base')
-          let base
-          try {
+            const raiz = git(['rev-parse', '--show-toplevel']).trim()
+            const tmp = mkdtempSync(join(tmpdir(), 'audit-base-'))
+            const wt = join(tmp, 'base')
+            let base
             try {
-              git(['cat-file', '-e', `${baseSha}^{commit}`], raiz)
-            } catch {
-              git(['fetch', '--no-tags', '--depth=1', 'origin', baseSha], raiz)
+              try {
+                git(['cat-file', '-e', `${baseSha}^{commit}`], raiz)
+              } catch {
+                git(['fetch', '--no-tags', '--depth=1', 'origin', baseSha], raiz)
+              }
+              git(['worktree', 'add', '--detach', wt, baseSha], raiz)
+              base = avisos(wt, `base ${baseSha.slice(0, 8)}`)
+            } finally {
+              try { git(['worktree', 'remove', '--force', wt], raiz) } catch {}
+              rmSync(tmp, { recursive: true, force: true })
             }
-            git(['worktree', 'add', '--detach', wt, baseSha], raiz)
-            base = avisos(wt, `base ${baseSha.slice(0, 8)}`)
-          } finally {
-            try { git(['worktree', 'remove', '--force', wt], raiz) } catch {}
-            rmSync(tmp, { recursive: true, force: true })
-          }
-          const hoy = avisos(raiz, 'head')
+            const hoy = avisos(raiz, 'head')
 
-          const nuevos = [...hoy.values()].filter((a) => !base.has(clave(a)))
-          const heredados = [...hoy.values()].filter((a) => base.has(clave(a)))
+            const nuevos = [...hoy.values()].filter((a) => !base.has(clave(a)))
+            const heredados = [...hoy.values()].filter((a) => base.has(clave(a)))
 
-          console.log(`Base ${baseSha.slice(0, 8)}: ${base.size} avisos high/critical. Head: ${hoy.size}.`)
-          if (heredados.length) {
-            console.log(`Deuda heredada de la base (no bloquea): ${heredados.length}`)
-            for (const a of heredados) console.log(`  ${a.gravedad}  ${a.ghsa}  ${a.paquete} ${a.versionesAfectadas}`)
+            console.log(`Base ${baseSha.slice(0, 8)}: ${base.size} avisos high/critical. Head: ${hoy.size}.`)
+            if (heredados.length) {
+              console.log(`Deuda heredada de la base (no bloquea): ${heredados.length}`)
+              for (const a of heredados) console.log(`  ${a.gravedad}  ${a.ghsa}  ${a.paquete} ${a.versionesAfectadas}`)
+            }
+            if (nuevos.length) {
+              console.error(`::error::${nuevos.length} aviso(s) NUEVO(s) high/critical introducidos por este PR:`)
+              for (const a of nuevos) console.error(`  ${a.gravedad}  ${a.ghsa}  ${a.paquete} ${a.versionesAfectadas} — ${a.titulo}`)
+              return 1
+            }
+            console.log('✓ ningún aviso nuevo respecto a la base')
+            return 0
           }
-          if (nuevos.length) {
-            console.error(`::error::${nuevos.length} aviso(s) NUEVO(s) high/critical introducidos por este PR:`)
-            for (const a of nuevos) console.error(`  ${a.gravedad}  ${a.ghsa}  ${a.paquete} ${a.versionesAfectadas} — ${a.titulo}`)
-            process.exit(1)
+
+          try {
+            process.exitCode = main()
+          } catch (e) {
+            console.error(`::error::${e instanceof Falla ? e.message : `no se pudo medir: ${e?.message ?? e}`}. Sale con 2, no con 1: no es «hay avisos nuevos».`)
+            process.exitCode = 2
           }
-          console.log('✓ ningún aviso nuevo respecto a la base')
           AUDIT_EOF
           # Sin `corepack enable` (escribe symlinks globales que los 4 runners del Mac
           # comparten): pnpm fijado por npx dentro del script.
