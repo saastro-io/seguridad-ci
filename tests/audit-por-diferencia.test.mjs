@@ -85,6 +85,11 @@ test('deuda heredada: el mismo aviso en la base no bloquea → 0', () => {
   assert.match(r.out, /Deuda heredada/)
 })
 
+test('aviso critical nuevo → 1', () => {
+  const { dir, sha } = repo(json(), json(aviso('GHSA-crit', 'critical')))
+  assert.equal(correr(dir, sha).code, 1)
+})
+
 test('aviso nuevo solo moderate/low → 0', () => {
   const { dir, sha } = repo(json(), json(aviso('GHSA-bajo', 'moderate')))
   assert.equal(correr(dir, sha).code, 0)

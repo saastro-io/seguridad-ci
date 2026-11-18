@@ -26,4 +26,4 @@ jobs:
         with:
           node-version: 24
       - name: Pruebas del script por diferencia
-        run: node --test tests/
+        run: node --test "tests/*.test.mjs"
